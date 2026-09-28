@@ -4,9 +4,15 @@ import json
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from .. import models
+from .. import merging, models
 from ..database import get_db
-from ..schemas import ReagentCreate, ReagentOut, ReagentUpdate
+from ..schemas import (
+    ReagentCreate,
+    ReagentMergeConfirmIn,
+    ReagentMergeIn,
+    ReagentOut,
+    ReagentUpdate,
+)
 
 router = APIRouter(prefix="/api/reagents", tags=["reagents"])
 
@@ -43,6 +49,29 @@ def create_reagent(reagent_in: ReagentCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(reagent)
     return reagent
+
+
+@router.post("/merge/preview")
+def preview_reagent_merge(payload: ReagentMergeIn, db: Session = Depends(get_db)):
+    """重复档案合并预览（不落库）。
+
+    返回受影响的方案步骤数量、逐方案明细、来源 / 保留两侧名称与类别，
+    以及一个**仅对本次预览有效**的一次性确认令牌 ``confirm_token``。
+    """
+    return merging.preview_merge(db, payload.source_reagent_id, payload.target_reagent_id)
+
+
+@router.post("/merge/confirm")
+def confirm_reagent_merge(payload: ReagentMergeConfirmIn, db: Session = Depends(get_db)):
+    """凭预览令牌执行合并。
+
+    预览后任一档案属性或受影响步骤变化 → 409 并要求重新预览；
+    通过后单事务完成：步骤引用迁移 → 展示快照更新 → 已确认步骤转待复核
+    → 删除来源档案。失败时整体回滚，不留下部分迁移。
+    """
+    return merging.confirm_merge(
+        db, payload.source_reagent_id, payload.target_reagent_id, payload.confirm_token
+    )
 
 
 @router.get("/{reagent_id}", response_model=ReagentOut)

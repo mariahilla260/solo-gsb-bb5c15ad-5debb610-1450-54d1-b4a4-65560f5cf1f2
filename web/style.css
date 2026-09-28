@@ -589,3 +589,19 @@ textarea { resize: vertical; }
 .bk-item-name { font-weight: 600; }
 .bk-item-cats { display: inline-flex; gap: 4px; flex-wrap: wrap; }
 .bk-sep { cursor: pointer; }
+
+/* ---------- 重复档案合并 ---------- */
+.merge-sides { display: flex; align-items: center; margin: 10px 0; gap: 12px; }
+.merge-side {
+  flex: 1;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  background: var(--bg);
+  min-width: 0;
+}
+.merge-arrow { font-size: 22px; color: var(--brand); }
+@media (max-width: 720px) {
+  .merge-sides { flex-direction: column; }
+  .merge-arrow { transform: rotate(90deg); }
+}

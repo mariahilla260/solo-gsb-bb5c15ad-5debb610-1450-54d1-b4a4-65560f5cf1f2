@@ -49,6 +49,19 @@ class ReagentOut(ReagentBase):
         return value or []
 
 
+class ReagentMergeIn(BaseModel):
+    """重复档案合并预览：选择来源（将被删除）与保留档案。"""
+
+    source_reagent_id: int
+    target_reagent_id: int
+
+
+class ReagentMergeConfirmIn(ReagentMergeIn):
+    """合并确认：必须携带仅本次预览有效的一次性确认令牌。"""
+
+    confirm_token: str = Field(min_length=8, max_length=256)
+
+
 # ---------- 步骤 / 方案 ----------
 
 def _clean_measures(cls, value):

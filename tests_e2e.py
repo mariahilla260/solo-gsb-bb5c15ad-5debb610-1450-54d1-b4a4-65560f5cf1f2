@@ -809,5 +809,189 @@ check("预览不落库（无新增记录/方案）", len(runs_after_bk) == len(r
 for rid in (bkA, bkB, bkC, bkD, bkE, bkP, bkQ):
     call("DELETE", f"/api/reagents/{rid}")
 
+# ---------- 13. 重复试剂档案合并（预览令牌 / 乐观拒绝 / 单事务迁移 / 待复核 / 历史快照） ----------
+print("【场景13】重复试剂档案合并")
+
+# 来源（重复建档）与保留档案；另建一个引用来源的方案
+s, src = call("POST", "/api/reagents", {"name": "测试-盐酸重复档", "categories": ["strong_acid"]})
+check("创建来源档案", s == 201, (s, src))
+merge_src = src["id"]
+s, tgt = call("POST", "/api/reagents", {"name": "测试-盐酸保留档", "cas": "7647-01-0",
+                                        "categories": ["strong_acid"]})
+check("创建保留档案", s == 201, (s, tgt))
+merge_tgt = tgt["id"]
+s, other_rg = call("POST", "/api/reagents", {"name": "测试-氯化钠M", "categories": ["halide_salt"]})
+other_id = other_rg["id"]
+
+s, mp = call("POST", "/api/plans", {"name": "测试-合并方案", "steps": [
+    {"order_index": 0, "reagent_id": merge_src, "time_offset_min": 0, "amount_ml": 10,
+     "safety_measures": ["goggles"], "safety_confirmed": True},
+    {"order_index": 1, "reagent_id": other_id, "time_offset_min": 2, "amount_ml": 20,
+     "safety_measures": ["gloves"], "safety_confirmed": True},
+    {"order_index": 2, "reagent_id": merge_src, "time_offset_min": 5, "amount_ml": 5},
+]})
+check("创建引用来源的方案", s == 201, (s, mp))
+merge_plan = mp["id"]
+src_step_ids = [st["id"] for st in mp["steps"] if st["reagent_id"] == merge_src]
+confirmed_src_step_id = next(
+    st["id"] for st in mp["steps"]
+    if st["reagent_id"] == merge_src and st["safety_confirmed"]
+)
+unconfirmed_src_step_id = next(
+    st["id"] for st in mp["steps"]
+    if st["reagent_id"] == merge_src and not st["safety_confirmed"]
+)
+other_step_id = next(st["id"] for st in mp["steps"] if st["reagent_id"] == other_id)
+check("方案中有 2 个步骤引用来源", len(src_step_ids) == 2, src_step_ids)
+
+# 预览：不落库，返回两侧属性、步骤数、逐方案明细与令牌
+s, pv = call("POST", "/api/reagents/merge/preview",
+             {"source_reagent_id": merge_src, "target_reagent_id": merge_tgt})
+check("预览 200", s == 200, (s, pv))
+check("预览两侧名称/类别", pv["source"]["name"] == "测试-盐酸重复档"
+      and pv["target"]["name"] == "测试-盐酸保留档"
+      and pv["source"]["categories"] == ["strong_acid"]
+      and pv["target"]["categories"] == ["strong_acid"], pv)
+check("受影响步骤数=2、方案数=1", pv["affected_step_count"] == 2
+      and pv["affected_plan_count"] == 1, pv)
+plan_detail = pv["affected_plans"][0]
+check("逐方案明细带步骤与序号", plan_detail["plan_id"] == merge_plan
+      and plan_detail["step_count"] == 2
+      and [x["order_index"] for x in plan_detail["steps"]] == [0, 2], plan_detail)
+check("待复核计数=1（仅第1步有效确认）", pv["will_reset_to_review_count"] == 1,
+      pv["will_reset_to_review_count"])
+token = pv["confirm_token"]
+check("返回一次性确认令牌与有效期", bool(token) and pv["token_expires_in_seconds"] == 600, pv)
+s, still = call("GET", f"/api/reagents/{merge_src}")
+check("预览不落库（来源仍在）", s == 200, s)
+
+# 历史推演报告：先临时全部确认并落盘一条记录（报告内含来源档案名快照），
+# 随后取消第 3 步确认，恢复"2 个受影响步骤中仅 1 个有效确认"的预览口径
+for st in mp["steps"]:
+    call("PUT", f"/api/plans/{merge_plan}/steps/{st['id']}/safety",
+         {"safety_measures": ["goggles"], "confirmed": True})
+s, pre_run = call("POST", f"/api/plans/{merge_plan}/simulate?persist=true")
+check("合并前落盘推演记录", s == 200 and pre_run["run_id"] is not None, s)
+pre_run_id = pre_run["run_id"]
+check("落盘报告含来源档案名快照", "测试-盐酸重复档" in json.dumps(pre_run, ensure_ascii=False))
+call("PUT", f"/api/plans/{merge_plan}/steps/{unconfirmed_src_step_id}/safety",
+     {"safety_measures": [], "confirmed": False})
+
+# 参数 / 路径错误
+s, e = call("POST", "/api/reagents/merge/preview",
+            {"source_reagent_id": merge_src, "target_reagent_id": merge_src})
+check("来源与保留相同 422", s == 422, s)
+s, e = call("POST", "/api/reagents/merge/preview",
+            {"source_reagent_id": 999999, "target_reagent_id": merge_tgt})
+check("来源不存在 404", s == 404, s)
+s, e = call("POST", "/api/reagents/merge/confirm",
+            {"source_reagent_id": merge_src, "target_reagent_id": merge_tgt, "confirm_token": "x"})
+check("令牌过短 422", s == 422, s)
+s, e = call("POST", "/api/reagents/merge/confirm",
+            {"source_reagent_id": merge_src, "target_reagent_id": merge_tgt,
+             "confirm_token": "not-a-real-token-0123456789"})
+check("伪造令牌 409", s == 409 and "重新预览" in e["detail"], (s, e))
+
+# 乐观并发：预览后来源档案属性变化 → 拒绝，令牌作废，需重新预览
+s, _ = call("PUT", f"/api/reagents/{merge_src}", {"note": "即将合并"})
+s, e = call("POST", "/api/reagents/merge/confirm",
+            {"source_reagent_id": merge_src, "target_reagent_id": merge_tgt, "confirm_token": token})
+check("属性变化后确认被拒 409", s == 409 and "来源档案" in e["detail"], (s, e))
+s, e2 = call("POST", "/api/reagents/merge/confirm",
+             {"source_reagent_id": merge_src, "target_reagent_id": merge_tgt, "confirm_token": token})
+check("令牌一次性（再次使用拒绝）", s == 409, s)
+s, still_src = call("GET", f"/api/reagents/{merge_src}")
+check("拒绝后无部分迁移（来源仍在）", s == 200 and still_src["note"] == "即将合并", s)
+s, mp_unchanged = call("GET", f"/api/plans/{merge_plan}")
+check("拒绝后步骤引用未变", all(
+    (st["reagent_id"] == merge_src) == (st["id"] in src_step_ids)
+    for st in mp_unchanged["steps"]), mp_unchanged["steps"])
+# 还原属性以便后续重新预览
+call("PUT", f"/api/reagents/{merge_src}", {"note": None})
+
+# 乐观并发：预览后受影响步骤变化 → 拒绝
+s, pv2 = call("POST", "/api/reagents/merge/preview",
+              {"source_reagent_id": merge_src, "target_reagent_id": merge_tgt})
+token2 = pv2["confirm_token"]
+s, _ = call("PUT", f"/api/plans/{merge_plan}/steps/{unconfirmed_src_step_id}/safety",
+            {"safety_measures": ["ventilation"], "confirmed": False})
+s, e = call("POST", "/api/reagents/merge/confirm",
+            {"source_reagent_id": merge_src, "target_reagent_id": merge_tgt, "confirm_token": token2})
+check("步骤变化后确认被拒 409", s == 409 and "步骤" in e["detail"], (s, e))
+s, still_src2 = call("GET", f"/api/reagents/{merge_src}")
+check("步骤变化拒绝后来源仍在（无部分迁移）", still_src2 is not None and still_src2["id"] == merge_src, s)
+
+# 重新预览 → 确认成功
+s, pv3 = call("POST", "/api/reagents/merge/preview",
+              {"source_reagent_id": merge_src, "target_reagent_id": merge_tgt})
+check("重新预览步骤数仍为 2", pv3["affected_step_count"] == 2
+      and pv3["will_reset_to_review_count"] == 1, pv3)
+s, res = call("POST", "/api/reagents/merge/confirm",
+              {"source_reagent_id": merge_src, "target_reagent_id": merge_tgt,
+               "confirm_token": pv3["confirm_token"]})
+check("确认合并成功", s == 200 and res["kind"] == "labmix-reagent-merge-result"
+      and res["migrated_step_count"] == 2 and res["target_reagent_id"] == merge_tgt, (s, res))
+s, gone = call("GET", f"/api/reagents/{merge_src}")
+check("来源档案已删除", s == 404, s)
+s, plan_after = call("GET", f"/api/plans/{merge_plan}")
+check("步骤引用已迁到保留档案", all(st["reagent_id"] == merge_tgt for st in
+      [x for x in plan_after["steps"] if x["id"] in src_step_ids]), plan_after["steps"])
+check("展示快照更新为保留档案名称与类别", all(
+    st["reagent_name"] == "测试-盐酸保留档" and st["categories"] == ["strong_acid"]
+    for st in plan_after["steps"] if st["id"] in src_step_ids), plan_after["steps"])
+mig_states = {st["id"]: st for st in plan_after["steps"]}
+check("已确认步骤转待复核", mig_states[confirmed_src_step_id]["safety_confirmed"] is False
+      and mig_states[confirmed_src_step_id]["safety_stale"] is True, mig_states[confirmed_src_step_id])
+check("原本未确认步骤保持未确认（不点亮待复核）",
+      mig_states[unconfirmed_src_step_id]["safety_confirmed"] is False
+      and mig_states[unconfirmed_src_step_id]["safety_stale"] is False, mig_states[unconfirmed_src_step_id])
+check("未受影响步骤状态不变", mig_states[other_step_id]["safety_confirmed"] is True
+      and mig_states[other_step_id]["safety_stale"] is False, mig_states[other_step_id])
+check("方案摘要统计待复核", plan_after["safety_summary"]["stale_steps"] == 1
+      and plan_after["safety_summary"]["all_confirmed"] is False, plan_after["safety_summary"])
+s, e = call("POST", f"/api/plans/{merge_plan}/simulate?persist=true")
+check("转待复核后正式推演被门槛拦截", s == 409 and "待复核" in e["detail"], (s, e))
+
+# 列表与详情立即按保留档案展示（合并后新建引用保留档案的方案同样工作）
+s, plans_list = call("GET", "/api/plans")
+listed = next(p for p in plans_list if p["id"] == merge_plan)
+check("方案列表立即反映待复核", listed["safety_summary"]["stale_steps"] == 1, listed["safety_summary"])
+
+# 历史推演报告保持原快照（合并前的记录仍是来源档案名与当时依据）
+s, hist = call("GET", f"/api/runs/{pre_run_id}")
+check("历史报告合并后仍可取回", s == 200, s)
+check("历史报告保持原快照（仍含来源档案名）",
+      "测试-盐酸重复档" in json.dumps(hist, ensure_ascii=False)
+      and "测试-盐酸保留档" not in json.dumps(hist, ensure_ascii=False), "snapshot rewritten?")
+s, hist_exp = call("GET", f"/api/runs/{pre_run_id}/export")
+check("历史导出同样保持原快照", "测试-盐酸重复档" in json.dumps(hist_exp, ensure_ascii=False), s)
+# 合并后实时推演则按保留档案
+s, live = call("POST", f"/api/plans/{merge_plan}/simulate?persist=false")
+check("合并后实时推演按保留档案", "测试-盐酸保留档" in json.dumps(live, ensure_ascii=False)
+      and "测试-盐酸重复档" not in json.dumps(live, ensure_ascii=False), "live report")
+
+# 重新确认后可正式推演
+for st in plan_after["steps"]:
+    call("PUT", f"/api/plans/{merge_plan}/steps/{st['id']}/safety",
+         {"safety_measures": ["goggles"], "confirmed": True})
+s, r = call("POST", f"/api/plans/{merge_plan}/simulate?persist=true")
+check("重新确认后正式推演放行", s == 200 and r["run_id"] is not None, s)
+
+# 无引用步骤的档案也可合并（等同删除来源）
+s, empty_src = call("POST", "/api/reagents", {"name": "测试-空来源", "categories": []})
+s, pv4 = call("POST", "/api/reagents/merge/preview",
+              {"source_reagent_id": empty_src["id"], "target_reagent_id": merge_tgt})
+check("零引用预览步骤数=0", pv4["affected_step_count"] == 0, pv4)
+s, res4 = call("POST", "/api/reagents/merge/confirm",
+               {"source_reagent_id": empty_src["id"], "target_reagent_id": merge_tgt,
+                "confirm_token": pv4["confirm_token"]})
+check("零引用合并成功并删除来源", s == 200 and res4["migrated_step_count"] == 0, (s, res4))
+s, gone4 = call("GET", f"/api/reagents/{empty_src['id']}")
+check("零引用来源已删除", s == 404, s)
+
+call("DELETE", f"/api/plans/{merge_plan}")
+call("DELETE", f"/api/reagents/{merge_tgt}")
+call("DELETE", f"/api/reagents/{other_id}")
+
 print(f"\n结果：{PASS} 通过，{FAIL} 失败")
 sys.exit(1 if FAIL else 0)
