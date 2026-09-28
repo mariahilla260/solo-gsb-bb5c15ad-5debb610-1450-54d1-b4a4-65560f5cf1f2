@@ -589,3 +589,24 @@ textarea { resize: vertical; }
 .bk-item-name { font-weight: 600; }
 .bk-item-cats { display: inline-flex; gap: 4px; flex-wrap: wrap; }
 .bk-sep { cursor: pointer; }
+
+/* ---------------- 重复档案合并 ---------------- */
+.merge-sides {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  margin: 10px 0;
+}
+.merge-side {
+  flex: 1;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg);
+  padding: 10px 12px;
+}
+.merge-arrow {
+  display: flex;
+  align-items: center;
+  font-size: 20px;
+  color: var(--brand);
+}

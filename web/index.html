@@ -12,7 +12,7 @@
       <span class="logo">⚗️</span>
       <div>
         <h1>实验室配液相容性推演台</h1>
-        <p class="subtitle">试剂属性 · 时序加液 · 规则图逐步推演 · 危险溯源 · 废液分桶 · CSV 导入 · 方案保存 / JSON 导出</p>
+        <p class="subtitle">试剂属性 · 重复档案合并 · 时序加液 · 规则图逐步推演 · 危险溯源 · 废液分桶 · CSV 导入 · 方案保存 / JSON 导出</p>
       </div>
     </div>
     <div class="rev" id="ruleRev" title="当前规则图版本">规则图版本 —</div>
@@ -169,6 +169,7 @@
         <div class="card">
           <div class="card-head">
             <h2>试剂档案库</h2>
+            <button type="button" class="btn btn-small" id="btnReagentMerge" title="把重复档案的步骤引用并入保留档案，并删除来源档案">🔀 合并重复档案</button>
             <input type="search" id="reagentSearch" class="search" placeholder="名称 / CAS / 分子式…" />
           </div>
           <ul class="item-list" id="reagentList"></ul>

@@ -49,6 +49,23 @@ class ReagentOut(ReagentBase):
         return value or []
 
 
+# ---------- 重复档案合并 ----------
+
+class ReagentMergePreviewIn(BaseModel):
+    """合并预览：选择来源档案（将被删除）与保留档案（接收步骤引用）。"""
+
+    source_reagent_id: int
+    target_reagent_id: int
+
+
+class ReagentMergeConfirmIn(BaseModel):
+    """合并确认：须回传预览令牌；预览后任一属性或受影响步骤变化将被拒绝。"""
+
+    source_reagent_id: int
+    target_reagent_id: int
+    token: str = Field(min_length=1, max_length=128)
+
+
 # ---------- 步骤 / 方案 ----------
 
 def _clean_measures(cls, value):

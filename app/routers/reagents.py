@@ -4,9 +4,15 @@ import json
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from .. import models
+from .. import merging, models
 from ..database import get_db
-from ..schemas import ReagentCreate, ReagentOut, ReagentUpdate
+from ..schemas import (
+    ReagentCreate,
+    ReagentMergeConfirmIn,
+    ReagentMergePreviewIn,
+    ReagentOut,
+    ReagentUpdate,
+)
 
 router = APIRouter(prefix="/api/reagents", tags=["reagents"])
 
@@ -87,7 +93,22 @@ def delete_reagent(reagent_id: int, db: Session = Depends(get_db)):
     if used:
         raise HTTPException(
             409,
-            f"试剂「{reagent.name}」正被 {used} 个加液步骤引用，请先修改相关方案后再删除。",
+            f"试剂「{reagent.name}」正被 {used} 个加液步骤引用，请先修改相关方案后再删除。"
+            "如需并入其他档案，请使用重复档案合并功能。",
         )
     db.delete(reagent)
     db.commit()
+
+
+@router.post("/merge/preview")
+def preview_reagent_merge(payload: ReagentMergePreviewIn, db: Session = Depends(get_db)):
+    """重复档案合并预览：受影响方案 / 步骤数、两侧名称类别与一次性确认令牌。"""
+    return merging.preview_merge(db, payload.source_reagent_id, payload.target_reagent_id)
+
+
+@router.post("/merge/confirm")
+def confirm_reagent_merge(payload: ReagentMergeConfirmIn, db: Session = Depends(get_db)):
+    """凭预览令牌执行合并：单事务迁移引用、更新快照、安全确认转待复核、删除来源档案。"""
+    return merging.confirm_merge(
+        db, payload.source_reagent_id, payload.target_reagent_id, payload.token
+    )

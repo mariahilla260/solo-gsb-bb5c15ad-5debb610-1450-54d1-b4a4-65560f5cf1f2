@@ -1321,6 +1321,157 @@ async function removeReagent(r) {
   } catch (err) { toast(err.message, true); }
 }
 
+/* ---------------- 重复档案合并 ---------------- */
+
+const mergeState = { preview: null, sourceId: null, targetId: null };
+
+function reagentOptionList(selectedId) {
+  return '<option value="">— 请选择试剂档案 —</option>' +
+    state.reagents
+      .slice()
+      .sort((a, b) => a.name.localeCompare(b.name, "zh"))
+      .map((r) => `<option value="${r.id}" ${r.id === selectedId ? "selected" : ""}>${escapeHtml(r.name)}</option>`)
+      .join("");
+}
+
+function openMergeModal() {
+  mergeState.preview = null;
+  mergeState.sourceId = null;
+  mergeState.targetId = null;
+  openModal(`
+    <button class="btn btn-ghost modal-close">✕ 关闭</button>
+    <h3>🔀 合并重复试剂档案</h3>
+    <p class="hint">选择<b>来源档案</b>（将被删除）与<b>保留档案</b>（保留其属性，接收全部步骤引用），
+      先预览受影响的方案步骤并取得一次性确认令牌，再确认执行。
+      合并在<b>单个事务</b>内完成：迁移步骤引用、更新步骤展示名称，
+      这些步骤的安全确认会转为 <span class="badge badge-medium">⚠️ 待复核</span>；
+      <b>历史推演报告保持原快照</b>不变。预览后任一档案属性或受影响步骤发生变化，确认会被拒绝并要求重新预览。</p>
+    <div class="form-row">
+      <label>来源档案（合并后删除）
+        <select id="mergeSource">${reagentOptionList(null)}</select>
+      </label>
+      <label>保留档案（步骤将改引用它）
+        <select id="mergeTarget">${reagentOptionList(null)}</select>
+      </label>
+    </div>
+    <div class="form-actions">
+      <button type="button" class="btn" id="btnMergePreview">🔍 预览影响</button>
+    </div>
+    <div id="mergePreviewBox"></div>
+  `);
+  $("#modalBox").classList.add("modal-wide");
+  $("#mergeSource").addEventListener("change", (e) => {
+    mergeState.sourceId = e.target.value ? Number(e.target.value) : null;
+    mergeState.preview = null;
+    renderMergePreview(null);
+  });
+  $("#mergeTarget").addEventListener("change", (e) => {
+    mergeState.targetId = e.target.value ? Number(e.target.value) : null;
+    mergeState.preview = null;
+    renderMergePreview(null);
+  });
+  $("#btnMergePreview").addEventListener("click", requestMergePreview);
+}
+
+async function requestMergePreview() {
+  const sourceId = mergeState.sourceId;
+  const targetId = mergeState.targetId;
+  if (!sourceId || !targetId) { toast("请先选择来源档案与保留档案", true); return; }
+  if (sourceId === targetId) { toast("来源档案与保留档案不能是同一个试剂", true); return; }
+  try {
+    const preview = await api("/api/reagents/merge/preview", {
+      method: "POST",
+      body: { source_reagent_id: sourceId, target_reagent_id: targetId },
+    });
+    mergeState.preview = preview;
+    renderMergePreview(preview);
+  } catch (err) {
+    mergeState.preview = null;
+    renderMergePreview(null);
+    toast(err.message, true);
+  }
+}
+
+function reagentSideHtml(label, tag, side) {
+  const cats = (side.categories || []).map((c) =>
+    `<span class="badge badge-low">${escapeHtml(catLabel(c))}</span>`).join(" ") || '<span class="item-meta">无类别</span>';
+  const meta = [side.formula && `分子式 ${side.formula}`, side.cas && `CAS ${side.cas}`,
+    side.concentration, ({ liquid: "液体", solid: "固体", gas: "气体" })[side.state]]
+    .filter(Boolean).map(escapeHtml).join(" · ");
+  return `
+    <div class="merge-side">
+      <div class="item-title">${tag} ${escapeHtml(side.name)}
+        ${side.builtin ? '<span class="badge badge-ok">内置</span>' : ""}</div>
+      <div class="item-meta">${meta}</div>
+      <div class="item-meta">${cats}</div>
+      <div class="item-meta">${label}</div>
+    </div>`;
+}
+
+function renderMergePreview(preview) {
+  const box = $("#mergePreviewBox");
+  if (!box) return;
+  if (!preview) {
+    box.innerHTML = '<p class="hint" style="margin-top:8px">尚未生成预览；选择两个不同档案后点击「🔍 预览影响」。</p>';
+    return;
+  }
+  const plansHtml = preview.affected_plans.map((p) => `
+    <tr>
+      <td>#${p.plan_id} ${escapeHtml(p.plan_name)}</td>
+      <td>${p.step_count}</td>
+      <td class="item-meta">${p.steps.map((s) => `第 ${s.order_index + 1} 步「${escapeHtml(s.reagent_name)}」`).join("、") || "—"}</td>
+    </tr>`).join("");
+  box.innerHTML = `
+    <div class="merge-sides">
+      ${reagentSideHtml("来源档案：步骤引用将迁出，合并后删除", '<span class="badge badge-blocked">来源</span>', preview.source)}
+      <div class="merge-arrow">➡️</div>
+      ${reagentSideHtml("保留档案：保留属性并接收全部步骤引用", '<span class="badge badge-ok">保留</span>', preview.target)}
+    </div>
+    <p class="hint">受影响 <b>${preview.affected_plan_count}</b> 个方案、<b>${preview.affected_step_count}</b> 个加液步骤；
+      这些步骤的安全确认将转为<b>待复核</b>，确认令牌 10 分钟内一次性有效。</p>
+    <div class="table-wrap">
+      <table class="grid">
+        <thead><tr><th>受影响方案</th><th style="width:90px">步骤数</th><th>受影响步骤（预览时刻）</th></tr></thead>
+        <tbody>${plansHtml || '<tr><td colspan="3" class="item-meta">没有步骤引用来源档案（合并将仅删除该档案）</td></tr>'}</tbody>
+      </table>
+    </div>
+    <div class="form-actions">
+      <button type="button" class="btn btn-danger" id="btnMergeConfirm">✅ 确认合并并删除来源档案</button>
+    </div>
+  `;
+  $("#btnMergeConfirm").addEventListener("click", confirmMerge);
+}
+
+async function confirmMerge() {
+  const preview = mergeState.preview;
+  if (!preview) { toast("请先预览合并影响", true); return; }
+  if (!confirm(`确认把「${preview.source.name}」合并到「${preview.target.name}」？\n`
+      + `${preview.affected_step_count} 个步骤将改引用保留档案，安全确认转为待复核，来源档案将被删除。\n`
+      + "历史推演报告保持原快照。此操作不可撤销。")) return;
+  try {
+    const result = await api("/api/reagents/merge/confirm", {
+      method: "POST",
+      body: {
+        source_reagent_id: preview.source.id,
+        target_reagent_id: preview.target.id,
+        token: preview.token,
+      },
+    });
+    closeModal();
+    toast(`合并完成：迁移 ${result.migrated_step_count} 个步骤，来源档案已删除`);
+    mergeState.preview = null;
+    await Promise.all([loadReagents(), loadPlans()]);
+    renderSafetyProgress();
+  } catch (err) {
+    // 预览已失效（令牌一次性 / 数据已变化）：清空旧预览，要求重新预览
+    mergeState.preview = null;
+    renderMergePreview(null);
+    toast(err.message, true);
+  }
+}
+
+$("#btnReagentMerge").addEventListener("click", openMergeModal);
+
 /* ---------------- 规则列表 / 自定义 ---------------- */
 
 function renderRuleList() {

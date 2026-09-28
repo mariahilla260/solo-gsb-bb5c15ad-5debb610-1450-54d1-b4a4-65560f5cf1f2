@@ -809,5 +809,162 @@ check("预览不落库（无新增记录/方案）", len(runs_after_bk) == len(r
 for rid in (bkA, bkB, bkC, bkD, bkE, bkP, bkQ):
     call("DELETE", f"/api/reagents/{rid}")
 
+# ---------- 13. 重复试剂档案合并（预览令牌 / 陈旧拒绝 / 单事务迁移 / 历史快照不变） ----------
+print("【场景13】重复试剂档案合并")
+
+
+def mk_merge_reagent(name, cats):
+    s, r = call("POST", "/api/reagents", {"name": name, "categories": cats})
+    assert s == 201, (s, r)
+    return r["id"]
+
+
+mg_src = mk_merge_reagent("测试-重复盐酸来源", ["strong_acid"])
+mg_extra = mk_merge_reagent("测试-无引用重复档案", ["strong_acid"])
+mg_tgt = mk_merge_reagent("测试-重复盐酸保留", ["strong_acid"])
+s, mg_plan = call("POST", "/api/plans", {"name": "测试-档案合并", "steps": [
+    {"order_index": 0, "reagent_id": mg_src, "time_offset_min": 0, "amount_ml": 10},
+    {"order_index": 1, "reagent_id": mg_tgt, "time_offset_min": 5, "amount_ml": 20},
+]})
+assert s == 201, (s, mg_plan)
+mg_pid = mg_plan["id"]
+mg_step0 = mg_plan["steps"][0]["id"]
+confirm_all_steps(mg_pid)
+s, mg_run = call("POST", f"/api/plans/{mg_pid}/simulate?persist=true")
+assert s == 200, (s, mg_run)
+mg_run_id = mg_run["run_id"]
+s, mg_old_report = call("GET", f"/api/runs/{mg_run_id}")
+mg_old_name = mg_old_report["timeline"][0]["reagent_name"]
+check("合并前历史报告使用来源名", mg_old_name == "测试-重复盐酸来源", mg_old_name)
+
+# 预览：受影响步骤数、两侧名称类别、一次性令牌
+s, pv = call("POST", "/api/reagents/merge/preview",
+             {"source_reagent_id": mg_src, "target_reagent_id": mg_tgt})
+check("合并预览 200", s == 200, s)
+check("预览两侧名称与类别", pv["source"]["name"] == "测试-重复盐酸来源"
+      and pv["source"]["categories"] == ["strong_acid"]
+      and pv["target"]["name"] == "测试-重复盐酸保留", pv)
+check("预览受影响 1 方案 1 步骤", pv["affected_step_count"] == 1
+      and pv["affected_plan_count"] == 1
+      and pv["affected_plans"][0]["step_count"] == 1, pv)
+check("预览返回有效令牌与过期时间", bool(pv["token"]) and bool(pv["expires_at"]))
+s, _ = call("POST", "/api/reagents/merge/preview",
+            {"source_reagent_id": mg_tgt, "target_reagent_id": mg_tgt})
+check("来源与保留相同 422", s == 422, s)
+s, _ = call("POST", "/api/reagents/merge/preview",
+            {"source_reagent_id": 999999, "target_reagent_id": mg_tgt})
+check("来源档案不存在 404", s == 404, s)
+
+# 陈旧拒绝①：预览后修改保留档案类别
+s, pv1 = call("POST", "/api/reagents/merge/preview",
+              {"source_reagent_id": mg_src, "target_reagent_id": mg_tgt})
+assert s == 200, (s, pv1)
+call("PUT", f"/api/reagents/{mg_tgt}", {"categories": ["strong_acid", "oxidizer"]})
+s, e = call("POST", "/api/reagents/merge/confirm",
+            {"source_reagent_id": mg_src, "target_reagent_id": mg_tgt, "token": pv1["token"]})
+check("保留档案属性变化 → 409 stale_preview", s == 409
+      and e["detail"]["code"] == "stale_preview" and "target" in e["detail"]["changes"], (s, e))
+call("PUT", f"/api/reagents/{mg_tgt}", {"categories": ["strong_acid"]})
+
+# 陈旧拒绝②：预览后受影响步骤被修改（令牌一次性，旧令牌也不能重放）
+s, pv2 = call("POST", "/api/reagents/merge/preview",
+              {"source_reagent_id": mg_src, "target_reagent_id": mg_tgt})
+assert s == 200
+s, e = call("POST", "/api/reagents/merge/confirm",
+            {"source_reagent_id": mg_src, "target_reagent_id": mg_extra, "token": pv2["token"]})
+check("令牌与对象不匹配 → 409 且令牌作废", s == 409
+      and e["detail"]["code"] == "stale_preview", (s, e))
+s, e = call("POST", "/api/reagents/merge/confirm",
+            {"source_reagent_id": mg_src, "target_reagent_id": mg_tgt, "token": pv2["token"]})
+check("令牌一次性（重放 409 invalid_merge_token）", s == 409
+      and e["detail"]["code"] == "invalid_merge_token", (s, e))
+s, e = call("POST", "/api/reagents/merge/confirm",
+            {"source_reagent_id": mg_src, "target_reagent_id": mg_tgt, "token": "forged-token"})
+check("伪造令牌 409", s == 409 and e["detail"]["code"] == "invalid_merge_token", (s, e))
+
+s, pv3 = call("POST", "/api/reagents/merge/preview",
+              {"source_reagent_id": mg_src, "target_reagent_id": mg_tgt})
+assert s == 200
+call("PUT", f"/api/plans/{mg_pid}", {"steps": [
+    {"order_index": 0, "reagent_id": mg_src, "time_offset_min": 0, "amount_ml": 99},
+    {"order_index": 1, "reagent_id": mg_tgt, "time_offset_min": 5, "amount_ml": 20},
+]})
+s, e = call("POST", "/api/reagents/merge/confirm",
+            {"source_reagent_id": mg_src, "target_reagent_id": mg_tgt, "token": pv3["token"]})
+check("受影响步骤变化 → 409 stale_preview(steps)", s == 409
+      and "steps" in e["detail"]["changes"], (s, e))
+
+# 恢复方案并重新确认（整体替换步骤后确认已失效）
+call("PUT", f"/api/plans/{mg_pid}", {"steps": [
+    {"order_index": 0, "reagent_id": mg_src, "time_offset_min": 0, "amount_ml": 10},
+    {"order_index": 1, "reagent_id": mg_tgt, "time_offset_min": 5, "amount_ml": 20},
+]})
+confirm_all_steps(mg_pid)
+
+# 陈旧拒绝③：预览后新增引用来源档案的步骤
+s, pv4 = call("POST", "/api/reagents/merge/preview",
+              {"source_reagent_id": mg_src, "target_reagent_id": mg_tgt})
+assert s == 200
+call("PUT", f"/api/plans/{mg_pid}", {"steps": [
+    {"order_index": 0, "reagent_id": mg_src, "time_offset_min": 0, "amount_ml": 10},
+    {"order_index": 1, "reagent_id": mg_tgt, "time_offset_min": 5, "amount_ml": 20},
+    {"order_index": 2, "reagent_id": mg_src, "time_offset_min": 9, "amount_ml": 3},
+]})
+s, e = call("POST", "/api/reagents/merge/confirm",
+            {"source_reagent_id": mg_src, "target_reagent_id": mg_tgt, "token": pv4["token"]})
+check("新增引用步骤 → 409 stale_preview(steps)", s == 409
+      and "steps" in e["detail"]["changes"], (s, e))
+call("PUT", f"/api/plans/{mg_pid}", {"steps": [
+    {"order_index": 0, "reagent_id": mg_src, "time_offset_min": 0, "amount_ml": 10},
+    {"order_index": 1, "reagent_id": mg_tgt, "time_offset_min": 5, "amount_ml": 20},
+]})
+confirm_all_steps(mg_pid)
+
+# 正式合并
+s, pv5 = call("POST", "/api/reagents/merge/preview",
+              {"source_reagent_id": mg_src, "target_reagent_id": mg_tgt})
+assert s == 200
+s, mr = call("POST", "/api/reagents/merge/confirm",
+             {"source_reagent_id": mg_src, "target_reagent_id": mg_tgt, "token": pv5["token"]})
+check("确认合并 200", s == 200 and mr["merged"] is True, s)
+check("迁移 1 步并保留保留档案", mr["migrated_step_count"] == 1
+      and mr["target"]["id"] == mg_tgt, mr)
+s, _ = call("GET", f"/api/reagents/{mg_src}")
+check("来源档案已删除", s == 404, s)
+s, p_after = call("GET", f"/api/plans/{mg_pid}")
+check("方案详情立即显示保留档案", s == 200 and p_after["steps"][0]["reagent_id"] == mg_tgt
+      and p_after["steps"][0]["reagent_name"] == "测试-重复盐酸保留", p_after["steps"][0])
+check("迁移步骤安全确认转待复核", p_after["steps"][0]["safety_confirmed"] is False
+      and p_after["steps"][0]["safety_stale"] is True, p_after["steps"][0])
+check("未迁移步骤确认不受影响", p_after["steps"][1]["safety_confirmed"] is True
+      and p_after["steps"][1]["safety_stale"] is False, p_after["steps"][1])
+s, plans_list = call("GET", "/api/plans")
+p_list = next(p for p in plans_list if p["id"] == mg_pid)
+check("方案列表立即显示保留档案", all(
+      x["reagent_name"] == "测试-重复盐酸保留" for x in p_list["safety_summary"]["steps"]),
+      p_list["safety_summary"])
+s, e = call("POST", f"/api/plans/{mg_pid}/simulate?persist=true")
+check("合并后待复核步骤阻塞正式推演 409", s == 409 and "待复核" in e["detail"], (s, e))
+s, rep = call("POST", f"/api/plans/{mg_pid}/simulate?persist=false")
+check("预检立即使用保留档案名称/类别", s == 200
+      and rep["timeline"][0]["reagent_name"] == "测试-重复盐酸保留", s)
+s, old_report2 = call("GET", f"/api/runs/{mg_run_id}")
+check("历史推演报告保持原快照", old_report2["timeline"][0]["reagent_name"] == mg_old_name
+      and old_report2["safety"]["steps"][0]["confirmed"] is True
+      and old_report2["safety"]["steps"][0]["stale"] is False, old_report2["timeline"][0])
+
+# 无步骤引用的重复档案：预览 0 步，确认即删除
+s, pv6 = call("POST", "/api/reagents/merge/preview",
+              {"source_reagent_id": mg_extra, "target_reagent_id": mg_tgt})
+check("无引用档案预览 0 步", s == 200 and pv6["affected_step_count"] == 0, pv6)
+s, mr6 = call("POST", "/api/reagents/merge/confirm",
+              {"source_reagent_id": mg_extra, "target_reagent_id": mg_tgt, "token": pv6["token"]})
+check("无引用档案合并删除成功", s == 200 and mr6["migrated_step_count"] == 0, s)
+s, _ = call("GET", f"/api/reagents/{mg_extra}")
+check("无引用来源档案已删除", s == 404, s)
+
+call("DELETE", f"/api/plans/{mg_pid}")
+call("DELETE", f"/api/reagents/{mg_tgt}")
+
 print(f"\n结果：{PASS} 通过，{FAIL} 失败")
 sys.exit(1 if FAIL else 0)
